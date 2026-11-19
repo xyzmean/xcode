@@ -15,6 +15,7 @@ const allTargets = [
   { name: 'darwin-arm64', target: 'bun-darwin-arm64', ext: '' },
   { name: 'darwin-x64', target: 'bun-darwin-x64', ext: '' },
   { name: 'windows-x64', target: 'bun-windows-x64', ext: '.exe' },
+  { name: 'windows-arm64', target: 'bun-windows-arm64', ext: '.exe' },
 ] as const
 
 const requested = process.argv.find(a => a.startsWith('--target='))?.slice('--target='.length)

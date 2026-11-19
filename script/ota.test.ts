@@ -1,9 +1,10 @@
 import { expect, test } from 'bun:test'
-import { createHash, generateKeyPairSync, sign } from 'node:crypto'
+import { createHash, generateKeyPairSync } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { updateNativeBinary } from '../src/utils/nativeInstaller/ota.js'
+import { signOtaManifest } from './sign-ota.js'
 
 test('OTA verifies signed metadata and payload before replacing the installed executable', async () => {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519')
@@ -11,22 +12,28 @@ test('OTA verifies signed metadata and payload before replacing the installed ex
   const executable = join(dir, 'test-xcode')
   const payload = 'new binary'
   const manifest = Buffer.from(JSON.stringify({ version: '0.0.2', targets: {
-    'linux-x64': { size: payload.length, sha256: createHash('sha256').update(payload).digest('hex') },
+    'windows-arm64': { size: payload.length, sha256: createHash('sha256').update(payload).digest('hex') },
   } }))
-  const signature = sign(null, manifest, privateKey)
+  const signature = signOtaManifest(manifest, privateKey, publicKey)
+  expect(() => signOtaManifest(manifest, privateKey)).toThrow('does not match')
   let corruptSignature = true
   let artifact = 'bad binary'
   let downloads = 0
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
-    switch (new URL(req.url).pathname) {
-      case '/manifest.json': return new Response(manifest)
-      case '/manifest.json.sig': return new Response(corruptSignature ? Buffer.alloc(64) : signature)
-      case '/xcode-linux-x64': downloads++; return new Response(artifact)
+    const url = new URL(req.url)
+    switch (url.pathname) {
+      case '/manifest.json':
+      case '/manifest.json.sig':
+      case '/xcode-windows-arm64.exe':
+        return Response.redirect(new URL(`/assets${url.pathname}`, url))
+      case '/assets/manifest.json': return new Response(manifest)
+      case '/assets/manifest.json.sig': return new Response(corruptSignature ? Buffer.alloc(64) : signature)
+      case '/assets/xcode-windows-arm64.exe': downloads++; return new Response(artifact)
       default: return new Response(null, { status: 404 })
     }
   } })
   const update = (currentVersion = '0.0.1') => updateNativeBinary({
-    currentVersion, executable, target: 'linux-x64', downloadRoot: server.url.href, signingKey: publicKey,
+    currentVersion, executable, target: 'windows-arm64', downloadRoot: server.url.href, signingKey: publicKey,
   })
   try {
     await writeFile(executable, 'old binary')

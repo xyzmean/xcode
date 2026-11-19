@@ -8,11 +8,11 @@ import { pipeline } from 'node:stream/promises'
 import { gt, valid } from 'semver'
 import { z } from 'zod/v4'
 import { lock } from '../lockfile.js'
+import { otaPublicKey } from './otaPublicKey.js'
 
-export const OTA_DOWNLOAD = 'http://10.8.0.1/xcode/releases/latest/download/'
-const publicKey = `-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAwxYzV80NXAEtKNV1brMMpOVOOiCTw+wt7u816dfm8O8=
------END PUBLIC KEY-----`
+export const OTA_DOWNLOAD = 'https://github.com/xyzmean/xcode/releases/latest/download/'
+
+const supportedTarget = /^(linux|darwin|windows)-(x64|arm64)$/
 
 const manifestSchema = z.object({
   version: z.string().refine(version => valid(version) === version),
@@ -23,7 +23,7 @@ const manifestSchema = z.object({
 })
 
 async function request(url: URL, signal: AbortSignal): Promise<Response> {
-  const response = await fetch(url, { signal, redirect: 'error' })
+  const response = await fetch(url, { signal })
   if (!response.ok || !response.body) {
     await response.body?.cancel()
     throw new Error(`OTA request failed (HTTP ${response.status})`)
@@ -50,7 +50,7 @@ async function readBounded(response: Response, limit: number): Promise<Buffer> {
 
 export const nativeTarget = `${process.platform === 'win32' ? 'windows' : process.platform}-${process.arch}`
 export function otaArtifactName(target: string): string {
-  return `xcode-${target}${target === 'windows-x64' ? '.exe' : ''}`
+  return `xcode-${target}${target.startsWith('windows-') ? '.exe' : ''}`
 }
 
 export async function updateNativeBinary({
@@ -58,7 +58,7 @@ export async function updateNativeBinary({
   executable,
   target = nativeTarget,
   downloadRoot = OTA_DOWNLOAD,
-  signingKey = publicKey,
+  signingKey = otaPublicKey,
   onInstalling,
 }: {
   currentVersion: string
@@ -81,7 +81,7 @@ export async function updateNativeBinary({
   }
   const { version, targets } = manifestSchema.parse(JSON.parse(manifestBytes.toString('utf8')))
   if (!gt(version, currentVersion)) return { version: currentVersion, status: 'current' }
-  if (!/^(linux-(x64|arm64)|darwin-(x64|arm64)|windows-x64)$/.test(target)) {
+  if (!supportedTarget.test(target)) {
     throw new Error(`Unsupported OTA platform: ${target}`)
   }
   const artifact = targets[target]
@@ -129,7 +129,7 @@ export async function updateNativeBinary({
         await rename(staged, destination)
       } catch (error) {
         if (process.platform === 'win32') {
-          throw new Error('Close all xCode processes and install the new build from the WireGuard mirror.', { cause: error })
+          throw new Error('Close all xCode processes and install the new build from GitHub Releases.', { cause: error })
         }
         throw error
       }
