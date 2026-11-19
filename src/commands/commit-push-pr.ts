@@ -69,7 +69,7 @@ function getPromptContent(
 - NEVER update the git config
 - NEVER run destructive/irreversible git commands (like push --force, hard reset, etc) unless the user explicitly requests them
 - NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it
-- NEVER run force push to main/master, warn the user if they request it
+- Prefer repairing Git mistakes without rewriting shared history. A normal push request does not authorize a rewrite. With explicit approval for the exact remote and branch, use \`--force-with-lease\` with the expected remote commit; never bypass branch protection.
 - Do not commit files that likely contain secrets (.env, credentials.json, etc)
 - Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported
 

@@ -22,7 +22,7 @@ type RequestBody = {
   model: string
   input: Item[]
   parallel_tool_calls?: boolean
-  tools: { name: string; parameters: { required: string[]; properties: Record<string, { type: string }> } }[]
+  tools: { name: string; description: string; parameters: { required: string[]; properties: Record<string, { type: string }> } }[]
 }
 
 test('Responses API runs parallel reads, edits, writes and a delegated check', async () => {
@@ -140,7 +140,7 @@ test('Responses API runs parallel reads, edits, writes and a delegated check', a
     }
     const [code, stdout, stderr] = await run([
       '--debug-to-stderr', 'Fix source.txt, write a derived output.txt, and delegate a reference check.',
-      '--tools', 'Read,Edit,Write,Agent', '--permission-mode', 'acceptEdits',
+      '--tools', 'Read,Edit,Write,Agent,Bash', '--permission-mode', 'acceptEdits',
       '--allowedTools', 'Read,Edit,Write,Agent', '--max-turns', '6',
     ])
     expect({ code, stderr, stdout, turns: requests.length }).toMatchObject({
@@ -151,6 +151,9 @@ test('Responses API runs parallel reads, edits, writes and a delegated check', a
     expect(await readFile(source, 'utf8')).toBe('  after\n  untouched\n')
     expect(await readFile(output, 'utf8')).toBe('reference-value\n')
     expect(requests[0]).toMatchObject({ model: 'gpt-6.2-sol', parallel_tool_calls: true })
+    const bashPrompt = requests[0]!.tools.find(tool => tool.name === 'Bash')!.description
+    expect(bashPrompt).toContain('--force-with-lease')
+    expect(bashPrompt).not.toContain('noreply@anthropic.com')
     const tools = Object.fromEntries(requests[0]!.tools.map(tool => [tool.name, tool.parameters]))
     expect(tools.Edit).toMatchObject({
       required: ['file_path', 'old_string', 'new_string'],
@@ -188,6 +191,151 @@ test('Responses API runs parallel reads, edits, writes and a delegated check', a
     await rm(dir, { recursive: true, force: true })
   }
 }, 30_000)
+
+test.each(['proactive', 'reactive'] as const)('Responses API %s compact resumes without printing the summary', async trigger => {
+  const dir = await mkdtemp(join(tmpdir(), 'xcode-compact-'))
+  const binary = process.env.XCODE_TEST_BINARY ??
+    join(import.meta.dirname, '..', 'dist', `${process.platform === 'win32' ? 'windows' : process.platform}-${process.arch}`, process.platform === 'win32' ? 'xcode.exe' : 'xcode')
+  const fixture = join(dir, 'history.txt')
+  const oldContext = 'old-history-marker'
+  const summary = 'internal-summary-marker: the file was read; return the result.'
+  const requests: (RequestBody & { instructions: string; prompt_cache_key: string })[] = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(req) {
+      if (new URL(req.url).pathname !== '/responses') return new Response(null, { status: 404 })
+      const body = await req.json() as (typeof requests)[number]
+      const turn = requests.push(body)
+      const input = JSON.stringify(body.input)
+      const isCompact = input.includes('Your task is to create a detailed summary of the conversation so far')
+      if (trigger === 'reactive' && turn === 2) {
+        return Response.json({ error: { code: 'context_length_exceeded', message: 'Your input exceeds the context window of this model.' } }, { status: 400 })
+      }
+      const id = `item_${turn}`
+      const events: object[] = []
+      if (turn === 1) {
+        const item = { id, type: 'function_call', call_id: 'call_read', name: 'Read' }
+        events.push(
+          { type: 'response.output_item.added', item: { ...item, arguments: '' } },
+          { type: 'response.output_item.done', item: { ...item, arguments: JSON.stringify({ file_path: fixture }) } },
+        )
+      } else {
+        const item = { id, type: 'message' }
+        events.push(
+          { type: 'response.output_item.added', item },
+          { type: 'response.output_text.delta', item_id: id, delta: isCompact ? `<analysis>draft</analysis>\n<summary>${summary}</summary>` : 'Task resumed and finished.' },
+          { type: 'response.output_item.done', item },
+        )
+      }
+      events.push({
+        type: 'response.completed',
+        response: { id: `resp_${turn}`, usage: { input_tokens: turn === 1 && trigger === 'proactive' ? 390_000 : 100, output_tokens: 20 } },
+      })
+      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+    },
+  })
+
+  try {
+    await writeFile(fixture, `${oldContext} ${'old history '.repeat(512)}\n`)
+    const proc = Bun.spawn([
+      binary, '--print', `Read ${fixture} and return the result.`,
+      '--output-format', 'stream-json', '--verbose', '--no-session-persistence',
+      '--tools', 'Read', '--allowedTools', 'Read',
+    ], {
+      cwd: dir,
+      env: { PATH: process.env.PATH, HOME: dir, USERPROFILE: dir, OPENAI_API_KEY: 'local-test-only', OPENAI_BASE_URL: server.url.origin },
+      stdout: 'pipe', stderr: 'pipe', signal: AbortSignal.timeout(20_000),
+    })
+    const [code, stdout, stderr] = await Promise.all([proc.exited, proc.stdout.text(), proc.stderr.text()])
+    expect({ code, stdout, stderr, requests: requests.length }).toMatchObject({
+      code: 0,
+      stdout: expect.stringContaining('Task resumed and finished.'),
+      requests: trigger === 'proactive' ? 3 : 4,
+    })
+    expect(stdout).toContain('"subtype":"compact_boundary"')
+    expect(stdout).not.toContain(summary)
+    expect(stdout).not.toContain('Prompt is too long')
+    const compact = requests.at(-2)!
+    const resumed = requests.at(-1)!
+    expect(compact.instructions).toEqual(requests[0]!.instructions)
+    expect(compact.tools).toEqual(requests[0]!.tools)
+    expect(compact.prompt_cache_key).toEqual(requests[0]!.prompt_cache_key)
+    if (trigger === 'reactive') {
+      expect(compact.input.slice(0, requests[1]!.input.length)).toEqual(requests[1]!.input)
+    }
+    expect(JSON.stringify(compact.input)).toContain(oldContext)
+    expect(JSON.stringify(resumed.input)).not.toContain(oldContext)
+    expect(JSON.stringify(resumed.input)).toContain(summary)
+    expect(JSON.stringify(resumed.input)).toContain('Resume directly')
+    expect(JSON.stringify(resumed.input).length).toBeLessThan(JSON.stringify(compact.input).length)
+  } finally {
+    await server.stop(true)
+    await rm(dir, { recursive: true, force: true })
+  }
+}, 30_000)
+
+test('manual /compact persists a shorter context without outputting the internal summary', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'xcode-manual-compact-'))
+  const binary = process.env.XCODE_TEST_BINARY ??
+    join(import.meta.dirname, '..', 'dist', `${process.platform === 'win32' ? 'windows' : process.platform}-${process.arch}`, process.platform === 'win32' ? 'xcode.exe' : 'xcode')
+  const session = crypto.randomUUID()
+  const history = 'manual-old-history-marker'
+  const summary = 'manual-internal-summary-marker'
+  const requests: RequestBody[] = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(req) {
+      if (new URL(req.url).pathname !== '/responses') return new Response(null, { status: 404 })
+      const turn = requests.push(await req.json() as RequestBody)
+      const item = { type: 'message', id: `msg_${turn}` }
+      const events = [
+        { type: 'response.output_item.added', item },
+        { type: 'response.output_text.delta', item_id: item.id, delta: turn === 2 ? `<summary>${summary}</summary>` : 'Task response.' },
+        { type: 'response.output_item.done', item },
+        { type: 'response.completed', response: { id: `resp_${turn}`, usage: { input_tokens: 100, output_tokens: 20 } } },
+      ]
+      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+    },
+  })
+
+  try {
+    const run = async (prompt: string, sessionArgs: string[]) => {
+      const proc = Bun.spawn([
+        binary, '--print', prompt, '--output-format', 'stream-json', '--verbose', '--tools', '', ...sessionArgs,
+      ], {
+        cwd: dir,
+        env: { PATH: process.env.PATH, HOME: dir, USERPROFILE: dir, OPENAI_API_KEY: 'local-test-only', OPENAI_BASE_URL: server.url.origin },
+        stdout: 'pipe', stderr: 'pipe', signal: AbortSignal.timeout(15_000),
+      })
+      const [code, stdout, stderr] = await Promise.all([proc.exited, proc.stdout.text(), proc.stderr.text()])
+      expect({ code, stdout, stderr }).toMatchObject({ code: 0 })
+      return stdout
+    }
+    await run(`${history} ${'old history '.repeat(512)}`, ['--session-id', session])
+    const compactOutput = await run('/compact Preserve the current task.', ['--resume', session])
+    expect(compactOutput).toContain('"subtype":"compact_boundary"')
+    expect(compactOutput).not.toContain(summary)
+    expect(requests).toHaveLength(2)
+    expect(await run('Continue the task.', ['--resume', session])).toContain('Task response.')
+    expect(requests).toHaveLength(3)
+    const compactInput = JSON.stringify(requests[1]!.input)
+    const resumedInput = JSON.stringify(requests[2]!.input)
+    expect(compactInput).toContain(history)
+    expect(compactInput).toContain('Preserve the current task.')
+    expect(resumedInput).not.toContain(history)
+    expect(resumedInput).toContain(summary)
+    expect(resumedInput.length).toBeLessThan(compactInput.length)
+  } finally {
+    await server.stop(true)
+    await rm(dir, { recursive: true, force: true })
+  }
+}, 45_000)
 
 test('native xCode uses system ripgrep for Glob and Grep', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'xcode-search-'))

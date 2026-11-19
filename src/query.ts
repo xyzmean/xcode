@@ -40,6 +40,7 @@ import type {
 import { logError } from './utils/log.js'
 import {
   PROMPT_TOO_LONG_ERROR_MESSAGE,
+  isMediaSizeErrorMessage,
   isPromptTooLongMessage,
 } from './services/api/errors.js'
 import { logAntError, logForDebugging } from './utils/debug.js'
@@ -170,8 +171,6 @@ const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
  * continue. Yielding early leaks an intermediate error to SDK callers (e.g.
  * cowork/desktop) that terminate the session on any `error` field — the
  * recovery loop keeps running but nobody is listening.
- *
- * Mirrors reactiveCompact.isWithheldPromptTooLong.
  */
 function isWithheldMaxOutputTokens(
   msg: Message | StreamEvent | undefined,
@@ -624,15 +623,16 @@ async function* queryLoop(
     // flip during the 5-30s stream, and withhold-without-recover would eat
     // the message. PTL doesn't hoist because its withholding is ungated —
     // it predates the experiment and is already the control-arm baseline.
-    const mediaRecoveryEnabled =
-      reactiveCompact?.isReactiveCompactEnabled() ?? false
+    const reactiveRecoveryEnabled =
+      reactiveCompact !== null &&
+      querySource !== 'compact' &&
+      querySource !== 'session_memory' &&
+      isAutoCompactEnabled()
     if (
       !compactionResult &&
       querySource !== 'compact' &&
       querySource !== 'session_memory' &&
-      !(
-        reactiveCompact?.isReactiveCompactEnabled() && isAutoCompactEnabled()
-      ) &&
+      !reactiveRecoveryEnabled &&
       !collapseOwnsIt
     ) {
       const { isAtBlockingLimit } = calculateTokenWarningState(
@@ -812,12 +812,10 @@ async function* queryLoop(
                 withheld = true
               }
             }
-            if (reactiveCompact?.isWithheldPromptTooLong(message)) {
-              withheld = true
-            }
             if (
-              mediaRecoveryEnabled &&
-              reactiveCompact?.isWithheldMediaSizeError(message)
+              reactiveRecoveryEnabled &&
+              message.type === 'assistant' &&
+              (isPromptTooLongMessage(message) || isMediaSizeErrorMessage(message))
             ) {
               withheld = true
             }
@@ -1072,8 +1070,8 @@ async function* queryLoop(
       // (full summary). Single-shot on each — if a retry still 413's,
       // the next stage handles it or the error surfaces.
       const isWithheld413 =
-        lastMessage?.type === 'assistant' &&
-        lastMessage.isApiErrorMessage &&
+        (reactiveRecoveryEnabled || collapseOwnsIt) &&
+        lastMessage !== undefined &&
         isPromptTooLongMessage(lastMessage)
       // Media-size rejections (image/PDF/many-image) are recoverable via
       // reactive compact's strip-retry. Unlike PTL, media errors skip the
@@ -1084,8 +1082,9 @@ async function* queryLoop(
       // post-compact turn will media-error again; hasAttemptedReactiveCompact
       // prevents a spiral and the error surfaces.
       const isWithheldMedia =
-        mediaRecoveryEnabled &&
-        reactiveCompact?.isWithheldMediaSizeError(lastMessage)
+        reactiveRecoveryEnabled &&
+        lastMessage !== undefined &&
+        isMediaSizeErrorMessage(lastMessage)
       if (isWithheld413) {
         // First: drain all staged context-collapses. Gated on the PREVIOUS
         // transition not being collapse_drain_retry — if we already drained
@@ -1120,11 +1119,10 @@ async function* queryLoop(
           }
         }
       }
-      if ((isWithheld413 || isWithheldMedia) && reactiveCompact) {
+      if ((isWithheld413 || isWithheldMedia) && reactiveRecoveryEnabled && reactiveCompact) {
         const compacted = await reactiveCompact.tryReactiveCompact({
           hasAttempted: hasAttemptedReactiveCompact,
           querySource,
-          aborted: toolUseContext.abortController.signal.aborted,
           messages: messagesForQuery,
           cacheSafeParams: {
             systemPrompt,

@@ -238,6 +238,7 @@ function buildInstructions(
     qs.startsWith('repl_main_thread') ||
     qs.startsWith('agent:') ||
     qs === 'sdk' ||
+    (qs === 'compact' && options.skipCacheWrite === true) ||
     qs === 'hook_agent' ||
     qs === 'verification_agent'
 

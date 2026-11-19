@@ -561,9 +561,9 @@ export class QueryEngine {
         if (
           msg.type === 'user' &&
           typeof msg.message.content === 'string' &&
+          !msg.isCompactSummary &&
           (msg.message.content.includes(`<${LOCAL_COMMAND_STDOUT_TAG}>`) ||
-            msg.message.content.includes(`<${LOCAL_COMMAND_STDERR_TAG}>`) ||
-            msg.isCompactSummary)
+            msg.message.content.includes(`<${LOCAL_COMMAND_STDERR_TAG}>`))
         ) {
           yield {
             type: 'user',
@@ -575,7 +575,7 @@ export class QueryEngine {
             parent_tool_use_id: null,
             uuid: msg.uuid,
             timestamp: msg.timestamp,
-            isReplay: !msg.isCompactSummary,
+            isReplay: true,
             isSynthetic: msg.isMeta || msg.isVisibleInTranscriptOnly,
           } as SDKUserMessageReplay
         }
@@ -783,7 +783,7 @@ export class QueryEngine {
           break
         case 'user':
           this.mutableMessages.push(message)
-          yield* normalizeMessage(message)
+          if (!message.isCompactSummary) yield* normalizeMessage(message)
           break
         case 'stream_event':
           if (message.event.type === 'message_start') {
