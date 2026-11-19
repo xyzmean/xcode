@@ -4,17 +4,24 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.4), auto for next patch, or blank to build only'
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: xcode-release
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -22,14 +29,50 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.4.4'
-      - name: Check release version
-        if: github.event_name == 'push'
+      - name: Resolve release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          version=$(bun -p 'require("./package.json").version')
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "Expected tag v$version, got $GITHUB_REF_NAME" >&2
-            exit 1
+          stable='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          package_version=$(bun -p 'require("./package.json").version')
+          version=$package_version
+          tag=''
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "Expected tag v$version, got $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            tag=$GITHUB_REF_NAME
+          elif [[ -n "$REQUESTED_VERSION" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+              echo 'Manual releases must run on the default branch' >&2
+              exit 1
+            fi
+            if [[ "$REQUESTED_VERSION" != auto && ! "$REQUESTED_VERSION" =~ $stable ]]; then
+              echo 'Enter a version like 0.1.4 or auto' >&2
+              exit 1
+            fi
+            refs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref')
+            latest=$(while IFS= read -r ref; do
+              candidate=${ref#refs/tags/v}
+              if [[ "$candidate" =~ $stable ]]; then printf '%s\n' "$candidate"; fi
+            done <<< "$refs" | sort -V | tail -n 1)
+            base=$(printf '%s\n' "$package_version" "$latest" | sort -V | tail -n 1)
+            if [[ "$REQUESTED_VERSION" == auto ]]; then
+              version=$(bun -e 'const base = process.argv[1]; const dot = base.lastIndexOf("."); console.log(base.slice(0, dot + 1) + (BigInt(base.slice(dot + 1)) + 1n))' "$base")
+            else
+              version=$REQUESTED_VERSION
+              if [[ "$version" == "$latest" || "$(printf '%s\n' "$base" "$version" | sort -V | tail -n 1)" != "$version" ]]; then
+                echo "Version must be at least $package_version and newer than any existing release tag" >&2
+                exit 1
+              fi
+            fi
+            tag=v$version
           fi
+          printf 'version=%s\ntag=%s\n' "$version" "$tag" >> "$GITHUB_OUTPUT"
       - run: bun install --frozen-lockfile
       - name: Install ripgrep for integration tests
         run: |
@@ -37,6 +80,8 @@ jobs:
           sudo apt-get install -y ripgrep
           rg --version
       - run: bun run build:all
+        env:
+          XCODE_BUILD_VERSION: ${{ steps.version.outputs.version }}
       - run: bun test script/openai.integration.test.ts script/ota.test.ts
       - name: Stage release assets
         run: |
@@ -57,7 +102,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: needs.build.outputs.tag != ''
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -77,11 +122,31 @@ jobs:
       - name: Verify checksums
         working-directory: release
         run: sha256sum --check SHA256SUMS
-      - name: Sign OTA manifest
+      - name: Verify version and sign OTA manifest
         env:
+          TAG: ${{ needs.build.outputs.tag }}
           XCODE_OTA_SIGNING_KEY: ${{ secrets.XCODE_OTA_SIGNING_KEY }}
-        run: bun script/sign-ota.ts release
+        run: |
+          jq -e --arg version "${TAG#v}" '.version == $version' release/manifest.json > /dev/null
+          if [[ -z "$XCODE_OTA_SIGNING_KEY" ]]; then
+            echo '::error::Set the XCODE_OTA_SIGNING_KEY Actions secret before publishing a release.'
+            exit 1
+          fi
+          bun script/sign-ota.ts release
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME" release/*
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            ref="refs/tags/$TAG"
+            refs=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG")
+            existing=$(jq -r --arg ref "$ref" '.[] | select(.ref == $ref) | .object.sha' <<< "$refs")
+            if [[ -z "$existing" ]]; then
+              gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$ref" -f sha="$GITHUB_SHA" > /dev/null
+            elif [[ "$existing" != "$GITHUB_SHA" ]]; then
+              echo "$TAG already points to another commit" >&2
+              exit 1
+            fi
+          fi
+          gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" release/*

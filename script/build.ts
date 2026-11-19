@@ -73,7 +73,7 @@ const missingModulesPlugin: BunPlugin = {
   },
 }
 
-const version = pkg.version
+const version = process.env.XCODE_BUILD_VERSION || pkg.version
 const buildTime = new Date().toISOString()
 const buildOptions = {
   entrypoints: ['./src/entrypoints/cli.tsx'],

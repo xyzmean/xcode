@@ -79,7 +79,7 @@ The integration suite uses a local Responses API fixture and does not require Op
 
 Standalone builds check [GitHub Releases](https://github.com/xyzmean/xcode/releases) at startup and every 30 minutes and verify the signed OTA manifest before installing. Run `xcode update` to check manually, or set `DISABLE_AUTOUPDATER=1` to turn off background checks. Restart xCode after installing an update.
 
-Pushing a tag matching `v<version>` in `package.json` publishes binaries for all six platforms. Set the Actions secret `XCODE_OTA_SIGNING_KEY` to the Ed25519 private key matching the updater’s public key before tagging. Manual workflow runs build without publishing.
+To publish, open **Actions → Release → Run workflow** on the default branch. Enter a version such as `0.1.4`, or `auto` to bump the patch above the highest release tag or the version in `package.json`, whichever is higher. Leave the field empty to build without publishing. The workflow creates the tag without committing a version bump to the branch. Pushing a tag matching `v<version>` in `package.json` also publishes. Publishing all six binaries requires the Actions secret `XCODE_OTA_SIGNING_KEY` containing the Ed25519 private key matching the updater’s public key.
 
 ## Русский
 
@@ -160,7 +160,7 @@ bun test script/openai.integration.test.ts
 
 Автономные сборки проверяют [GitHub Releases](https://github.com/xyzmean/xcode/releases) при запуске и каждые 30 минут. Перед установкой updater проверяет подпись манифеста. Для ручной проверки запустите `xcode update`; чтобы отключить фоновую проверку, задайте `DISABLE_AUTOUPDATER=1`. Перезапустите xCode после установки обновления.
 
-Пуш тега `v<версия>`, совпадающего с версией в `package.json`, публикует бинарники для всех шести платформ. Перед отправкой тега добавьте в секрет Actions `XCODE_OTA_SIGNING_KEY` закрытый ключ Ed25519, соответствующий открытому ключу updater. Ручной запуск workflow выполняет сборку без публикации.
+Для публикации откройте **Actions → Release → Run workflow** на основной ветке. Введите версию, например `0.1.4`, или `auto`, чтобы увеличить patch у большей из двух версий: последнего тега и версии в `package.json`. Пустое поле запускает только сборку. Workflow создаёт тег без коммита с изменением `package.json`. Пуш тега `v<версия>`, совпадающего с `package.json`, тоже запускает публикацию. Для публикации всех шести бинарников нужен секрет Actions `XCODE_OTA_SIGNING_KEY` с закрытым ключом Ed25519, соответствующим открытому ключу updater.
 
 ## 简体中文
 
@@ -241,4 +241,4 @@ bun test script/openai.integration.test.ts
 
 独立构建版本会在启动时及之后每 30 分钟通过 [GitHub Releases](https://github.com/xyzmean/xcode/releases) 检查更新，并在安装前验证 OTA 清单的签名。运行 `xcode update` 可手动检查，设置 `DISABLE_AUTOUPDATER=1` 可关闭后台检查。安装更新后请重启 xCode。
 
-推送与 `package.json` 版本匹配的 `v<版本号>` 标签后，GitHub Actions 会发布全部六种二进制文件。推送标签前，请将与更新程序公钥配对的 Ed25519 私钥保存到 Actions 密钥 `XCODE_OTA_SIGNING_KEY`。手动运行工作流只构建，不发布。
+要发布版本，请在默认分支上打开 **Actions → Release → Run workflow**。输入版本号（如 `0.1.4`），或输入 `auto` 将最高版本标签与 `package.json` 版本中较高者的补丁版本加一。留空仅构建，不发布。工作流会创建标签，但不会提交版本变更。推送与 `package.json` 版本匹配的 `v<版本号>` 标签也会触发发布。发布全部六种二进制文件前，请将与更新程序公钥配对的 Ed25519 私钥保存到 Actions 密钥 `XCODE_OTA_SIGNING_KEY`。
