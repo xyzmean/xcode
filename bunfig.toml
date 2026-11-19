@@ -1,0 +1,17 @@
+# Bun configuration for xCode development
+# See https://bun.sh/docs/runtime/bunfig
+
+[run]
+# Load the bun:bundle polyfill before the main entry point
+preload = ["./plugins/bunBundleDev.ts"]
+
+[define]
+# Build-time macros — injected as global constants
+"MACRO.VERSION" = '"0.0.2"'
+"MACRO.XCODE_STANDALONE" = 'false'
+"MACRO.BUILD_TIME" = '""'
+"MACRO.PACKAGE_URL" = '"@xyzmean/xcode"'
+"MACRO.NATIVE_PACKAGE_URL" = 'undefined'
+"MACRO.FEEDBACK_CHANNEL" = '""'
+"MACRO.ISSUES_EXPLAINER" = '"report at https://github.com/xyzmean/xcode/issues"'
+"MACRO.VERSION_CHANGELOG" = '""'

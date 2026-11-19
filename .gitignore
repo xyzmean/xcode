@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.bun-cache/
+*.tsbuildinfo
+.env
+.env.local
+bun.lockb
+package-lock.json
