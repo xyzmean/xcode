@@ -66,6 +66,7 @@ import {
 } from 'src/utils/process.js'
 import type { Stream } from 'src/utils/stream.js'
 import { EMPTY_USAGE } from 'src/services/api/logging.js'
+import { withOpenAIBudget } from 'src/services/api/openAIBudget.js'
 import {
   loadConversationForResume,
   type TurnInterruptionState,
@@ -447,7 +448,11 @@ export function canBatchWith(
   )
 }
 
-export async function runHeadless(
+export function runHeadless(...args: Parameters<typeof runHeadlessSession>): Promise<void> {
+  return withOpenAIBudget(args[7].maxBudgetUsd, () => runHeadlessSession(...args))
+}
+
+async function runHeadlessSession(
   inputPrompt: string | AsyncIterable<string>,
   getAppState: () => AppState,
   setAppState: (f: (prev: AppState) => AppState) => void,

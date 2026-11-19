@@ -1,4 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { getTotalCostUSD } from '../src/bootstrap/state.js'
+import { EMPTY_USAGE } from '../src/services/api/emptyUsage.js'
+import { queryOpenAIModel, sideQueryOpenAI } from '../src/services/api/openai.js'
+import { checkOpenAIRequestBudget, estimateOpenAIResponseCost, withOpenAIBudget } from '../src/services/api/openAIBudget.js'
+import { getEmptyToolPermissionContext } from '../src/Tool.js'
+import { createUserMessage } from '../src/utils/messages.js'
+import { asSystemPrompt } from '../src/utils/systemPromptType.js'
 import {
   clearActiveGoal,
   getActiveGoal,
@@ -79,6 +86,81 @@ describe('OpenAI model routing & context windows', () => {
     expect(getOpenAIContextWindow('gpt-5.6-sol')).toBe(400_000)
     expect(getOpenAIMaxOutputTokens('gpt-6.2-sol')).toBe(64_000)
     expect(getOpenAIMaxOutputTokens('gpt-6.2-sol-fast')).toBe(32_768)
+  })
+})
+
+describe('OpenAI USD budget', () => {
+  const official = { method: 'api-key', baseURL: 'https://api.openai.com/v1' }
+  const usage = { ...EMPTY_USAGE, input_tokens: 1000, cache_read_input_tokens: 2000, output_tokens: 500 }
+
+  test('prices uncached, cached and output tokens independently and switches long-context rates', () => {
+    expect(estimateOpenAIResponseCost(official, 'gpt-6.2-sol', usage)).toBeCloseTo(0.0072, 8)
+    expect(estimateOpenAIResponseCost(official, 'gpt-6.2-sol', { ...usage, input_tokens: 271_000 })).toBeCloseTo(1.0919, 8)
+    expect(estimateOpenAIResponseCost(official, 'gpt-6.2', usage)).toBeUndefined()
+    expect(estimateOpenAIResponseCost({ ...official, baseURL: 'https://custom.invalid/v1' }, 'gpt-6.2-sol', usage)).toBeUndefined()
+    expect(estimateOpenAIResponseCost({ ...official, method: 'codex-browser' }, 'gpt-6.2-sol', usage)).toBeUndefined()
+  })
+
+  test('settles side requests and prevents a budget-crossing response from yielding a tool call', async () => {
+    const prevKey = process.env.OPENAI_API_KEY
+    const prevURL = process.env.OPENAI_BASE_URL
+    const globals = globalThis as typeof globalThis & { MACRO?: { VERSION: string } }
+    const prevMacro = globals.MACRO
+    globals.MACRO = { VERSION: 'fixture' }
+    process.env.OPENAI_API_KEY = 'local-fixture-only'
+    delete process.env.OPENAI_BASE_URL
+    const fetch = spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const item = { type: 'function_call', id: 'item_budget', call_id: 'call_budget', name: 'Read', arguments: '{}' }
+      const events = [
+        { type: 'response.output_item.added', item },
+        { type: 'response.output_item.done', item },
+        { type: 'response.completed', response: { usage: { input_tokens: 3000, output_tokens: 500, input_tokens_details: { cached_tokens: 2000 } } } },
+      ]
+      return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(''))
+    })
+    try {
+      const before = getTotalCostUSD()
+      const side = { model: 'gpt-6.2-sol', messages: [{ role: 'user' as const, content: 'Fixture' }] }
+      await withOpenAIBudget(before + 0.01, async () => {
+        await sideQueryOpenAI(side)
+        expect(getTotalCostUSD() - before).toBeCloseTo(0.0072, 8)
+        const blocks: string[] = []
+        const run = async () => {
+          for await (const message of queryOpenAIModel(
+            [createUserMessage({ content: 'Fixture' })], asSystemPrompt(['Fixture system']), [], [],
+            new AbortController().signal,
+            { model: side.model, getToolPermissionContext: async () => getEmptyToolPermissionContext(),
+              isNonInteractiveSession: true, querySource: 'sdk', agents: [], hasAppendSystemPrompt: false, mcpTools: [] },
+          )) {
+            if (message.type === 'assistant') blocks.push(...message.message.content.map(block => block.type))
+          }
+        }
+        await expect(run()).rejects.toThrow('Reached maximum budget')
+        expect(blocks).not.toContain('tool_use')
+        expect(getTotalCostUSD() - before).toBeCloseTo(0.0144, 8)
+        await expect(sideQueryOpenAI(side)).rejects.toThrow('Reached maximum budget')
+        expect(fetch).toHaveBeenCalledTimes(2)
+      })
+      await withOpenAIBudget(before + 1, async () => {
+        await expect(sideQueryOpenAI({ ...side, model: 'gpt-6.2' })).rejects.toThrow('no verified API price')
+        expect(fetch).toHaveBeenCalledTimes(2)
+      })
+    } finally {
+      fetch.mockRestore()
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY
+      else process.env.OPENAI_API_KEY = prevKey
+      if (prevURL === undefined) delete process.env.OPENAI_BASE_URL
+      else process.env.OPENAI_BASE_URL = prevURL
+      if (prevMacro === undefined) delete globals.MACRO
+      else globals.MACRO = prevMacro
+    }
+  })
+
+  test('refuses unsupported endpoints only when a USD limit is requested', () => {
+    const gateway = { ...official, baseURL: 'https://custom.invalid/v1' }
+    expect(() => checkOpenAIRequestBudget(gateway, 'gpt-6.2-sol')).not.toThrow()
+    expect(() => withOpenAIBudget(getTotalCostUSD() + 1,
+      () => checkOpenAIRequestBudget(gateway, 'gpt-6.2-sol'))).toThrow('no verified API price')
   })
 })
 

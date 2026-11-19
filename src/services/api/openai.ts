@@ -6,8 +6,7 @@ import type {
   BetaMessage,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { getSessionId } from '../../bootstrap/state.js'
-import { renderOpenAISystemPrompt } from '../../constants/openaiPrompts.js'
-import { addToTotalSessionCost } from '../../cost-tracker.js'
+import type { NonNullableUsage } from '../../entrypoints/sdk/sdkUtilityTypes.js'
 import type { Tools } from '../../Tool.js'
 import type {
   AssistantMessage,
@@ -33,6 +32,8 @@ import {
 import type { Options } from './claude.js'
 import { PROMPT_TOO_LONG_ERROR_MESSAGE } from './errors.js'
 import { EMPTY_USAGE } from './emptyUsage.js'
+import { FallbackTriggeredError } from './withRetry.js'
+import { accountOpenAIResponse, checkOpenAIRequestBudget, OpenAIBudgetError } from './openAIBudget.js'
 
 const OPENAI_REASONING_SIG_PREFIX = 'openai_rs_v1:'
 
@@ -75,10 +76,24 @@ export function normalizeOpenAIContextOverflow(errText: string): string | null {
   return null
 }
 
-function serializeToolResultContent(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return JSON.stringify(content ?? '')
-  const parts: string[] = []
+type InputImage = { type: 'input_image'; image_url: string; detail: 'auto' }
+
+function asInputImage(block: Record<string, unknown>): InputImage | undefined {
+  if (block.type !== 'image' || !block.source || typeof block.source !== 'object') return
+  const source = block.source as Record<string, unknown>
+  if (source.type === 'base64' && typeof source.data === 'string' && typeof source.media_type === 'string') {
+    return { type: 'input_image', image_url: `data:${source.media_type};base64,${source.data}`, detail: 'auto' }
+  }
+  if (source.type === 'url' && typeof source.url === 'string') {
+    return { type: 'input_image', image_url: source.url, detail: 'auto' }
+  }
+}
+
+function serializeToolResultContent(content: unknown, isError: boolean): string | (InputImage | { type: 'input_text'; text: string })[] {
+  const errorPrefix = isError ? '[Tool Error]\n' : ''
+  if (typeof content === 'string') return errorPrefix + content
+  if (!Array.isArray(content)) return errorPrefix + JSON.stringify(content ?? '')
+  const parts: (string | InputImage)[] = []
   for (const item of content) {
     if (typeof item === 'string') {
       parts.push(item)
@@ -86,12 +101,16 @@ function serializeToolResultContent(content: unknown): string {
       const rec = item as Record<string, unknown>
       if (rec.type === 'text' && typeof rec.text === 'string') {
         parts.push(rec.text)
+      } else if (rec.type === 'image') {
+        const image = asInputImage(rec)
+        parts.push(!isError && image ? image : '[image omitted]')
       } else {
         parts.push(JSON.stringify(rec))
       }
     }
   }
-  return parts.join('\n')
+  if (parts.every(part => typeof part === 'string')) return errorPrefix + parts.join('\n')
+  return parts.map(part => typeof part === 'string' ? { type: 'input_text', text: part } : part)
 }
 
 function cleanJsonSchema(schema: unknown): Record<string, unknown> {
@@ -149,26 +168,15 @@ function convertMessagesToOpenAIInput(messages: Message[]): OpenAIInputItem[] {
         const b = block as Record<string, unknown>
         if (b.type === 'text' && typeof b.text === 'string') {
           userParts.push({ type: 'input_text', text: b.text })
-        } else if (b.type === 'image' && b.source && typeof b.source === 'object') {
-          const src = b.source as Record<string, unknown>
-          if (src.type === 'base64' && typeof src.data === 'string' && typeof src.media_type === 'string') {
-            userParts.push({
-              type: 'input_image',
-              image_url: `data:${src.media_type};base64,${src.data}`,
-            })
-          } else if (src.type === 'url' && typeof src.url === 'string') {
-            userParts.push({
-              type: 'input_image',
-              image_url: src.url,
-            })
-          }
+        } else if (b.type === 'image') {
+          const image = asInputImage(b)
+          if (image) userParts.push(image)
         } else if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
           flushUserParts()
-          const text = serializeToolResultContent(b.content)
           items.push({
             type: 'function_call_output',
             call_id: b.tool_use_id,
-            output: b.is_error === true ? `[Tool Error]\n${text}` : text,
+            output: serializeToolResultContent(b.content, b.is_error === true),
           })
         }
       }
@@ -226,32 +234,6 @@ function convertMessagesToOpenAIInput(messages: Message[]): OpenAIInputItem[] {
   }
 
   return items
-}
-
-function buildInstructions(
-  systemPrompt: SystemPrompt,
-  tools: Tools,
-  options: Options,
-): string {
-  const qs = String(options.querySource)
-  const isAgenticQuery =
-    qs.startsWith('repl_main_thread') ||
-    qs.startsWith('agent:') ||
-    qs === 'sdk' ||
-    (qs === 'compact' && options.skipCacheWrite === true) ||
-    qs === 'hook_agent' ||
-    qs === 'verification_agent'
-
-  if (!isAgenticQuery) {
-    return systemPrompt.filter(Boolean).join('\n\n')
-  }
-
-  const basePrompt = renderOpenAISystemPrompt(tools.map(t => t.name), options.model)
-  // Keep dynamic context sections (git status, CLAUDE.md, appendSystemPrompt) if present after the base prompt
-  const extraSections = systemPrompt.slice(1).filter(Boolean)
-  return extraSections.length > 0
-    ? `${basePrompt}\n\n${extraSections.join('\n\n')}`
-    : basePrompt
 }
 
 function mapReasoningEffort(
@@ -390,7 +372,7 @@ export async function* queryOpenAIModel(
     }
   }
 
-  const instructions = buildInstructions(systemPrompt, tools, options)
+  const instructions = systemPrompt.filter(Boolean).join('\n\n')
   const input = convertMessagesToOpenAIInput(
     ensureToolResultPairing(normalizeMessagesForAPI(messages, tools)),
   )
@@ -454,6 +436,7 @@ export async function* queryOpenAIModel(
         }],
       }, creds, signal, options.model))
     }),
+    options.fallbackModel,
   )
 }
 
@@ -488,42 +471,24 @@ async function requestOpenAIPromptSuggestion(
   }
 }
 
-function extractOpenAIUsage(u: Record<string, unknown> | undefined): {
-  input_tokens: number
-  cache_creation_input_tokens: number
-  cache_read_input_tokens: number
-  output_tokens: number
-  [key: string]: unknown
-} {
-  if (!u) {
-    return { ...(EMPTY_USAGE as Record<string, unknown>) } as {
-      input_tokens: number
-      cache_creation_input_tokens: number
-      cache_read_input_tokens: number
-      output_tokens: number
-      [key: string]: unknown
-    }
-  }
-  const inputDetails = (u.input_tokens_details ?? u.prompt_tokens_details) as
-    | Record<string, unknown>
-    | undefined
-  const cached =
-    typeof inputDetails?.cached_tokens === 'number' ? inputDetails.cached_tokens : 0
-  const totalIn =
-    typeof u.input_tokens === 'number'
-      ? u.input_tokens
-      : typeof u.prompt_tokens === 'number'
-        ? u.prompt_tokens
-        : 0
-  const totalOut =
-    typeof u.output_tokens === 'number'
-      ? u.output_tokens
-      : typeof u.completion_tokens === 'number'
-        ? u.completion_tokens
-        : 0
+function hasCapacityErrorCode(errorText: string): boolean {
+  return /"code"\s*:\s*"(?:overloaded|queue_exhausted|server_overloaded|service_unavailable)"/i.test(errorText)
+}
+
+function extractOpenAIUsage(data: Record<string, unknown>): NonNullableUsage | undefined {
+  const response = data.response as Record<string, unknown> | undefined
+  const usage = (response?.usage ?? data.usage) as Record<string, unknown> | undefined
+  if (!usage) return
+  const inputDetails = (usage.input_tokens_details ?? usage.prompt_tokens_details) as Record<string, unknown> | undefined
+  const cached = inputDetails?.cached_tokens ?? 0
+  const totalIn = usage.input_tokens ?? usage.prompt_tokens
+  const totalOut = usage.output_tokens ?? usage.completion_tokens
+  if (typeof totalIn !== 'number' || typeof totalOut !== 'number' || typeof cached !== 'number' ||
+      !Number.isSafeInteger(totalIn) || !Number.isSafeInteger(totalOut) || !Number.isSafeInteger(cached) ||
+      totalOut < 0 || cached < 0 || cached > totalIn) return
   return {
-    ...(EMPTY_USAGE as Record<string, unknown>),
-    input_tokens: Math.max(0, totalIn - cached),
+    ...EMPTY_USAGE,
+    input_tokens: totalIn - cached,
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: cached,
     output_tokens: totalOut,
@@ -537,6 +502,7 @@ async function* streamOpenAIResponse(
   accountingModel: string,
   maxRetries?: number,
   onCompleted?: (messages: AssistantMessage[]) => void,
+  fallbackModel?: string,
 ): AsyncGenerator<StreamEvent | AssistantMessage | SystemAPIErrorMessage, void> {
   const model = bodyObj.model as string
   const requestId = randomUUID()
@@ -565,14 +531,14 @@ async function* streamOpenAIResponse(
       url: `${creds.baseURL}/responses`,
       payload,
       creds,
+      model,
       buildHeaders,
       signal,
       maxRetries,
     })
   } catch (err) {
-    if (signal.aborted) {
-      throw new APIUserAbortError()
-    }
+    if (signal.aborted) throw new APIUserAbortError()
+    if (err instanceof OpenAIBudgetError) throw err
     yield createAssistantAPIErrorMessage({
       content: `OpenAI network error: ${err instanceof Error ? err.message : String(err)}`,
       apiError: 'unknown',
@@ -596,6 +562,10 @@ async function* streamOpenAIResponse(
       })
       return
     }
+    if (signal.aborted) throw new APIUserAbortError()
+    if (fallbackModel && (response.status === 503 || (response.status === 429 && hasCapacityErrorCode(errText)))) {
+      throw new FallbackTriggeredError(accountingModel, fallbackModel)
+    }
     yield createAssistantAPIErrorMessage({
       content: `OpenAI API error (${response.status}): ${errText.slice(0, 500)}`,
       apiError: response.status === 401 ? 'authentication_failed' : response.status === 429 ? 'rate_limit' : 'unknown',
@@ -607,21 +577,7 @@ async function* streamOpenAIResponse(
   let responseId = `resp_${requestId}`
   let nextBlockIndex = 0
   let hasToolCalls = false
-  let completed = false
   let ttftMs: number | undefined
-  let finalUsage: {
-    input_tokens: number
-    cache_creation_input_tokens: number
-    cache_read_input_tokens: number
-    output_tokens: number
-    [key: string]: unknown
-  } = { ...(EMPTY_USAGE as Record<string, unknown>) } as {
-    input_tokens: number
-    cache_creation_input_tokens: number
-    cache_read_input_tokens: number
-    output_tokens: number
-    [key: string]: unknown
-  }
   const yieldedMessages: AssistantMessage[] = []
 
   type ActiveItem =
@@ -834,7 +790,7 @@ async function* streamOpenAIResponse(
             stop_reason: null,
             stop_sequence: null,
             type: 'message',
-            usage: finalUsage,
+            usage: { ...EMPTY_USAGE },
             content: [block],
           },
           requestId,
@@ -857,20 +813,18 @@ async function* streamOpenAIResponse(
     }
 
     if (event === 'response.completed' || event === 'response.done') {
-      completed = true
-      const resp = payloadData.response as Record<string, unknown> | undefined
-      const u = (resp?.usage ?? payloadData.usage) as Record<string, unknown> | undefined
-      if (u) {
-        finalUsage = extractOpenAIUsage(u)
-      }
+      const usage = extractOpenAIUsage(payloadData)
+      const finalUsage = usage ?? EMPTY_USAGE
       const stopReason: 'tool_use' | 'end_turn' = hasToolCalls ? 'tool_use' : 'end_turn'
+      if (accountOpenAIResponse(creds, model, usage)) {
+        checkOpenAIRequestBudget(creds, model)
+      }
       for (const m of yieldedMessages) {
         const mutable = m as unknown as { message: { usage: unknown; stop_reason: unknown } }
         mutable.message.usage = finalUsage
         mutable.message.stop_reason = stopReason
         yield m
       }
-      addToTotalSessionCost(0, finalUsage as never, accountingModel)
       if (!hasToolCalls) onCompleted?.(yieldedMessages)
       yield {
         type: 'stream_event',
@@ -890,10 +844,13 @@ async function* streamOpenAIResponse(
         type: 'stream_event',
         event: { type: 'message_stop' },
       }
-      continue
+      return
     }
 
     if (event === 'response.incomplete') {
+      if (accountOpenAIResponse(creds, model, extractOpenAIUsage(payloadData))) {
+        checkOpenAIRequestBudget(creds, model)
+      }
       const resp = payloadData.response as Record<string, unknown> | undefined
       const details = resp?.incomplete_details as Record<string, unknown> | undefined
       const reason = typeof details?.reason === 'string' ? details.reason : 'unknown'
@@ -910,7 +867,11 @@ async function* streamOpenAIResponse(
         | Record<string, unknown>
         | undefined
       const msg = typeof errObj?.message === 'string' ? errObj.message : JSON.stringify(payloadData)
-      const overflow = normalizeOpenAIContextOverflow(msg)
+      const usage = extractOpenAIUsage(payloadData)
+      if ((usage || nextBlockIndex > 0) && accountOpenAIResponse(creds, model, usage)) {
+        checkOpenAIRequestBudget(creds, model)
+      }
+      const overflow = normalizeOpenAIContextOverflow(JSON.stringify(errObj ?? payloadData))
       if (overflow) {
         yield createAssistantAPIErrorMessage({
           content: PROMPT_TOO_LONG_ERROR_MESSAGE,
@@ -931,7 +892,10 @@ async function* streamOpenAIResponse(
 
   // Stream ended without response.completed — surface the failure instead of
   // silently returning a truncated turn with no usage accounting.
-  if (!completed && !signal.aborted) {
+  if (accountOpenAIResponse(creds, model, undefined) && !signal.aborted) {
+    checkOpenAIRequestBudget(creds, model)
+  }
+  if (!signal.aborted) {
     yield createAssistantAPIErrorMessage({
       content: 'OpenAI stream ended unexpectedly before completion. Please retry.',
       apiError: 'unknown',
@@ -944,6 +908,7 @@ async function fetchOpenAIWithRetry({
   url,
   payload,
   creds,
+  model,
   buildHeaders,
   signal,
   maxRetries = 3,
@@ -951,6 +916,7 @@ async function fetchOpenAIWithRetry({
   url: string
   payload: string | Uint8Array
   creds: Awaited<ReturnType<typeof getValidOpenAICredentials>>
+  model: string
   buildHeaders: (token: string, accountID?: string) => Record<string, string>
   signal?: AbortSignal
   maxRetries?: number
@@ -960,6 +926,8 @@ async function fetchOpenAIWithRetry({
   let refreshedOn401 = false
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) throw new APIUserAbortError()
+    checkOpenAIRequestBudget(creds, model)
     const res = await fetch(url, {
       method: 'POST',
       headers: buildHeaders(token, accountID),
@@ -1102,6 +1070,7 @@ export async function sideQueryOpenAI(opts: {
     url: `${creds.baseURL}/responses`,
     payload,
     creds,
+    model,
     maxRetries: opts.maxRetries ?? 2,
     signal: opts.signal,
     buildHeaders: (token, accountID) => ({
@@ -1127,6 +1096,7 @@ export async function sideQueryOpenAI(opts: {
   let stopReason: 'tool_use' | 'end_turn' = 'end_turn'
   let responseId = `resp_${requestId}`
   let usage = { ...EMPTY_USAGE }
+  let completed = false
   const activeText = new Map<string, string>()
   const activeTool = new Map<string, { callId: string; name: string; args: string }>()
 
@@ -1189,18 +1159,27 @@ export async function sideQueryOpenAI(opts: {
         activeTool.delete(item.id)
       }
     } else if (event === 'response.completed' || event === 'response.done') {
-      const resp = d.response as Record<string, unknown> | undefined
-      const u = (resp?.usage ?? d.usage) as Record<string, unknown> | undefined
-      if (u) {
-        usage = extractOpenAIUsage(u) as typeof EMPTY_USAGE
-      }
-    } else if (event === 'response.failed' || event === 'error') {
-      const errObj = (d.error ?? (d.response as Record<string, unknown> | undefined)?.error) as
-        | Record<string, unknown>
-        | undefined
-      const msg = typeof errObj?.message === 'string' ? errObj.message : JSON.stringify(d)
+      const final = extractOpenAIUsage(d)
+      usage = final ?? EMPTY_USAGE
+      if (accountOpenAIResponse(creds, model, final)) checkOpenAIRequestBudget(creds, model)
+      completed = true
+      break
+    } else if (event === 'response.failed' || event === 'error' || event === 'response.incomplete') {
+      const final = extractOpenAIUsage(d)
+      if ((final || event === 'response.incomplete' || contentBlocks.length || activeText.size || activeTool.size) &&
+          accountOpenAIResponse(creds, model, final)) checkOpenAIRequestBudget(creds, model)
+      const response = d.response as Record<string, unknown> | undefined
+      const errObj = (d.error ?? response?.error ?? response?.incomplete_details) as Record<string, unknown> | undefined
+      const msg = errObj?.message ?? errObj?.reason ?? event
       throw new Error(`OpenAI sideQuery failed: ${msg}`)
     }
+  }
+
+  if (!completed) {
+    const cannotPrice = accountOpenAIResponse(creds, model, undefined)
+    if (signal.aborted) throw new APIUserAbortError()
+    if (cannotPrice) checkOpenAIRequestBudget(creds, model)
+    throw new Error('OpenAI sideQuery stream ended before completion.')
   }
 
   return {

@@ -88,6 +88,7 @@ import {
   buildYoloRejectionMessage,
   DONT_ASK_REJECT_MESSAGE,
 } from '../messages.js'
+import { isOpenAIProviderActive } from '../model/openaiModels.js'
 import { calculateCostFromTokens } from '../modelCost.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { jsonStringify } from '../slowOperations.js'
@@ -722,9 +723,10 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
           ? 'blocked'
           : 'allowed'
 
-      // Compute classifier cost in USD for overhead analysis
+      // Responses side queries account for their own usage at the transport.
+      const useClaudePricing = !isOpenAIProviderActive()
       const classifierCostUSD =
-        classifierResult.usage && classifierResult.model
+        useClaudePricing && classifierResult.usage && classifierResult.model
           ? calculateCostFromTokens(
               classifierResult.model,
               classifierResult.usage,
@@ -761,9 +763,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
         classifierToolCallsLength: classifierResult.promptLengths?.toolCalls,
         classifierUserPromptsLength:
           classifierResult.promptLengths?.userPrompts,
-        // Session totals at time of classifier call (for computing overhead %).
-        // These are main-transcript-only — sideQuery (used by the classifier)
-        // does NOT call addToTotalSessionCost, so classifier tokens are excluded.
+        // Responses session totals include classifier side queries.
         sessionInputTokens: getTotalInputTokens(),
         sessionOutputTokens: getTotalOutputTokens(),
         sessionCacheReadInputTokens: getTotalCacheReadInputTokens(),
@@ -784,7 +784,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
         classifierStage1MsgId:
           classifierResult.stage1MsgId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         classifierStage1CostUSD:
-          classifierResult.stage1Usage && classifierResult.model
+          useClaudePricing && classifierResult.stage1Usage && classifierResult.model
             ? calculateCostFromTokens(
                 classifierResult.model,
                 classifierResult.stage1Usage,
@@ -803,7 +803,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
         classifierStage2MsgId:
           classifierResult.stage2MsgId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         classifierStage2CostUSD:
-          classifierResult.stage2Usage && classifierResult.model
+          useClaudePricing && classifierResult.stage2Usage && classifierResult.model
             ? calculateCostFromTokens(
                 classifierResult.model,
                 classifierResult.stage2Usage,

@@ -60,6 +60,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { loadMemoryPrompt } from '../memdir/memdir.js'
 import { isUndercover } from '../utils/undercover.js'
 import { isMcpInstructionsDeltaEnabled } from '../utils/mcpInstructionsDelta.js'
+import { getOpenAIModelFamilyGuidance } from './openaiPrompts.js'
 
 // Dead code elimination: conditional imports for feature-gated modules
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -208,6 +209,7 @@ function getSimpleDoingTasksSection(): string {
     `You are highly capable and often allow users to complete ambitious tasks that would otherwise be too complex or take too long. You should defer to user judgement about whether a task is too large to attempt.`,
     `If you notice the user's request is based on a misconception, or spot a bug adjacent to what they asked about, say so. You're a collaborator, not just an executor—users benefit from your judgment, not just your compliance.`,
     `In general, do not propose changes to code you haven't read. If a user asks about or wants you to modify a file, read it first. Understand existing code before suggesting modifications.`,
+    `When the user asks for implementation and the current permission mode allows it, don't stop at describing a plan: make the requested changes and run the relevant checks in the same turn unless genuinely blocked. For plan-only, review-only, or read-only requests, stay within that scope.`,
     `Do not create files unless they're absolutely necessary for achieving your goal. Generally prefer editing an existing file to creating a new one, as this prevents file bloat and builds on existing work more effectively.`,
     `Avoid giving time estimates or predictions for how long tasks will take, whether for your own work or for users planning projects. Focus on what needs to be done, not how long it might take.`,
     `If an approach fails, diagnose why before switching tactics—read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either. Escalate to the user with ${ASK_USER_QUESTION_TOOL_NAME} only when you're genuinely stuck after investigation, not as a first response to friction.`,
@@ -233,6 +235,8 @@ Examples of the kind of risky actions that warrant user confirmation:
 - Hard-to-reverse operations: force-pushing (can also overwrite upstream), git reset --hard, amending published commits, removing or downgrading packages/dependencies, modifying CI/CD pipelines
 - Actions visible to others or that affect shared state: pushing code, creating/closing/commenting on PRs or issues, sending messages (Slack, email, GitHub), posting to external services, modifying shared infrastructure or permissions
 - Uploading content to third-party web tools (diagram renderers, pastebins, gists) publishes it - consider whether it could be sensitive before sending, since it may be cached or indexed even if later deleted.
+
+For authorized Git work, use the user's configured identity and attribution preferences. If your own Git operation caused a problem, diagnose and repair it yourself within the authorized scope, preferring to preserve shared history. Authorization for a normal push does not authorize rewriting remote history; that requires explicit approval for the exact remote and branch.
 
 When you encounter an obstacle, do not use destructive actions as a shortcut to simply make it go away. For instance, try to identify root causes and fix underlying issues rather than bypassing safety checks (e.g. --no-verify). If you discover unexpected state like unfamiliar files, branches, or configuration, investigate before deleting or overwriting, as it may represent the user's in-progress work. For example, typically resolve merge conflicts rather than discarding changes; similarly, if a lock file exists, investigate what process holds it rather than deleting it. In short: only take risky actions carefully, and when in doubt, ask before acting. Follow both the spirit and letter of these instructions - measure twice, cut once.`
 }
@@ -333,6 +337,7 @@ function getSessionSpecificGuidanceSection(
     : `the ${GLOB_TOOL_NAME} or ${GREP_TOOL_NAME}`
 
   const items = [
+    `When a session goal is active (via /goal or SetGoal), work toward it within the user's authorized scope. Include <!-- GOAL_COMPLETE --> in your final response only after verifying the condition. If available, use GetGoal to re-read the condition and PauseGoal only when genuinely blocked on user input.`,
     hasAskUserQuestionTool
       ? `If you do not understand why the user has denied a tool call, use the ${ASK_USER_QUESTION_TOOL_NAME} to ask them.`
       : null,
@@ -433,6 +438,9 @@ export async function getSystemPrompt(
 
   const settings = getInitialSettings()
   const enabledTools = new Set(tools.map(_ => _.name))
+  const keepCodingInstructions =
+    outputStyleConfig === null ||
+    outputStyleConfig.keepCodingInstructions === true
 
   if (
     (feature('PROACTIVE') || feature('KAIROS')) &&
@@ -471,6 +479,14 @@ export async function getSystemPrompt(
     systemPromptSection('output_style', () =>
       getOutputStyleSection(outputStyleConfig),
     ),
+    ...(keepCodingInstructions &&
+    !(process.env.USER_TYPE === 'ant' && isUndercover())
+      ? [
+          systemPromptSection(`openai_model_profile:${model}`, () =>
+            getOpenAIModelFamilyGuidance(model),
+          ),
+        ]
+      : []),
     // When delta enabled, instructions are announced via persisted
     // mcp_instructions_delta attachments (attachments.ts) instead of this
     // per-turn recompute, which busts the prompt cache on late MCP connect.
@@ -527,10 +543,7 @@ export async function getSystemPrompt(
     // --- Static content (cacheable) ---
     getSimpleIntroSection(outputStyleConfig),
     getSimpleSystemSection(),
-    outputStyleConfig === null ||
-    outputStyleConfig.keepCodingInstructions === true
-      ? getSimpleDoingTasksSection()
-      : null,
+    keepCodingInstructions ? getSimpleDoingTasksSection() : null,
     getActionsSection(),
     getUsingYourToolsSection(enabledTools),
     getSimpleToneAndStyleSection(),

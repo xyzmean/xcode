@@ -229,7 +229,7 @@ export function formatTotalCost(): string {
   const costDisplay =
     formatCost(getTotalCostUSD()) +
     (hasUnknownModelCost()
-      ? ' (costs may be inaccurate due to usage of unknown models)'
+      ? ' (priced usage only; some requests could not be priced)'
       : '')
 
   const modelUsageDisplay = formatModelUsage()

@@ -9,17 +9,27 @@ import type { REPLHookContext } from '../src/utils/hooks/postSamplingHooks.js'
 import { createAssistantMessage, createUserMessage } from '../src/utils/messages.js'
 import { asSystemPrompt } from '../src/utils/systemPromptType.js'
 
+type InputBlock = {
+  type: string
+  text?: string
+  image_url?: string
+  detail?: string
+}
+
 type Item = {
   type: string
   id?: string
   call_id?: string
   name?: string
   arguments?: string
-  output?: string
+  output?: string | InputBlock[]
+  role?: string
+  content?: InputBlock[]
 }
 
 type RequestBody = {
   model: string
+  instructions: string
   input: Item[]
   parallel_tool_calls?: boolean
   tools: { name: string; description: string; parameters: { required: string[]; properties: Record<string, { type: string }> } }[]
@@ -346,7 +356,7 @@ test('native xCode uses system ripgrep for Glob and Grep', async () => {
     ['Grep', { pattern: 'search-fixture-marker', output_mode: 'content' }],
     ['Grep', { pattern: 'not-in-fixture' }],
   ] as const
-  const outputs = new Map<string, string | undefined>()
+  const outputs = new Map<string, Item['output']>()
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
@@ -644,3 +654,223 @@ test('side queries read final function arguments even when there are no deltas',
     await server.stop(true)
   }
 })
+
+const fixtureReply = 'Fixture response complete.'
+
+function responsesTurn(turn: number, result: string | { name: string; args: object }): Response {
+  const item = typeof result === 'string'
+    ? { id: `msg_${turn}`, type: 'message' }
+    : { id: `fc_${turn}`, type: 'function_call', call_id: `call_${turn}`, name: result.name, arguments: '' }
+  const events = [
+    { type: 'response.created', response: { id: `resp_${turn}` } },
+    { type: 'response.output_item.added', output_index: 0, item },
+    ...(typeof result === 'string' ? [
+      { type: 'response.output_text.delta', item_id: item.id, delta: result },
+      { type: 'response.output_item.done', item },
+    ] : [
+      { type: 'response.output_item.done', item: { ...item, arguments: JSON.stringify(result.args) } },
+    ]),
+    { type: 'response.completed', response: { id: `resp_${turn}`, usage: { input_tokens: 100, output_tokens: 20 } } },
+  ]
+  return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), {
+    headers: { 'Content-Type': 'text/event-stream' },
+  })
+}
+
+async function withResponsesCLI(
+  exercise: (fixture: {
+    dir: string
+    requests: RequestBody[]
+    run: (args: string[], cwd?: string) => Promise<{ code: number; stdout: string; stderr: string }>
+  }) => Promise<void>,
+  respond: (body: RequestBody, turn: number) => Response = (_, turn) => responsesTurn(turn, fixtureReply),
+) {
+  const dir = await mkdtemp(join(tmpdir(), 'xcode-responses-cli-'))
+  const home = join(dir, 'home')
+  const requests: RequestBody[] = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(req) {
+      if (req.method !== 'POST' || new URL(req.url).pathname !== '/responses') {
+        return new Response(null, { status: 404 })
+      }
+      const body = await req.json() as RequestBody
+      return respond(body, requests.push(body))
+    },
+  })
+  try {
+    await mkdir(home)
+    const binary = process.env.XCODE_TEST_BINARY ??
+      join(import.meta.dirname, '..', 'dist', `${process.platform === 'win32' ? 'windows' : process.platform}-${process.arch}`, process.platform === 'win32' ? 'xcode.exe' : 'xcode')
+    await exercise({
+      dir,
+      requests,
+      async run(args, cwd = dir) {
+        const proc = Bun.spawn([binary, '--print', '--no-session-persistence', 'Check the fixture.', ...args], {
+          cwd,
+          env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, OPENAI_API_KEY: 'local-test-only', OPENAI_BASE_URL: server.url.origin },
+          stdout: 'pipe', stderr: 'pipe', signal: AbortSignal.timeout(10_000),
+        })
+        const [code, stdout, stderr] = await Promise.all([proc.exited, proc.stdout.text(), proc.stderr.text()])
+        return { code, stdout, stderr }
+      },
+    })
+  } finally {
+    await server.stop(true)
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+test('Responses API sends only the exact custom system prompt and its append text', async () => {
+  await withResponsesCLI(async ({ requests, run }) => {
+    const custom = '  Custom fixture instructions.\nPreserve internal line breaks.  '
+    const append = '  Appended fixture instructions.\nPreserve trailing whitespace.  '
+    expect(await run(['--tools', '', '--system-prompt', custom, '--append-system-prompt', append]))
+      .toMatchObject({ code: 0, stdout: expect.stringContaining(fixtureReply) })
+    expect(requests.map(body => body.instructions)).toEqual([`${custom}\n\n${append}`])
+  })
+}, 15_000)
+
+test('Responses API includes default headings but omits them in --bare mode', async () => {
+  await withResponsesCLI(async ({ requests, run }) => {
+    const append = 'Explicit instructions still apply in bare mode.'
+    for (const args of [[], ['--bare', '--append-system-prompt', append]]) {
+      expect(await run(['--tools', 'Read', ...args])).toMatchObject({ code: 0, stdout: expect.stringContaining(fixtureReply) })
+    }
+    expect(requests).toHaveLength(2)
+    const headings = (body: RequestBody) => body.instructions.split('\n').filter(line => line.startsWith('# '))
+    expect(headings(requests[0]!)).toEqual(expect.arrayContaining([
+      '# System', '# Doing tasks', '# Using your tools', '# Environment', '# Model profile: Sol',
+    ]))
+    expect(headings(requests[1]!)).toEqual([])
+    expect(requests[1]!.instructions).toStartWith('You are xCode, an interactive AI coding CLI.\n\nCWD: ')
+    expect(requests[1]!.instructions).toEndWith(`\n\n${append}`)
+  })
+}, 25_000)
+
+test('Responses API applies a named agent role to the main request', async () => {
+  await withResponsesCLI(async ({ requests, run }) => {
+    const prompt = 'You are the fixture proofreader. Report spelling errors only.'
+    const initialPrompt = 'Inspect the fixture as a proofreader.'
+    const agents = JSON.stringify({ 'fixture-proofreader': {
+      description: 'Proofreads the fixture.', prompt, initialPrompt, model: 'gpt-6.2-astra',
+    } })
+    expect(await run(['--agents', agents, '--agent', 'fixture-proofreader', '--tools', '']))
+      .toMatchObject({ code: 0, stdout: expect.stringContaining(fixtureReply) })
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ model: 'gpt-6.2-astra', instructions: prompt })
+    const userText = requests[0]!.input.filter(item => item.role === 'user')
+      .flatMap(item => item.content ?? []).map(block => block.text ?? '').join('\n')
+    expect(userText).toContain(`${initialPrompt}\n\nCheck the fixture.`)
+  })
+}, 15_000)
+
+test.skipIf(process.platform === 'win32')('a delegated agent runs its Stop hook as SubagentStop', async () => {
+  const agentType = 'fixture-reviewer'
+  await withResponsesCLI(async ({ dir, requests, run }) => {
+    const agents = JSON.stringify({ [agentType]: {
+      description: 'Reviews the fixture.',
+      prompt: 'You are the delegated fixture reviewer.',
+      hooks: { Stop: [{ hooks: [{ type: 'command', command: 'cat >> agent-stop.jsonl' }] }] },
+    } })
+    expect(await run(['--agents', agents, '--tools', 'Agent', '--allowedTools', 'Agent']))
+      .toMatchObject({ code: 0, stdout: expect.stringContaining(fixtureReply) })
+    expect(requests).toHaveLength(3)
+    expect(requests[2]!.input).toContainEqual({ type: 'function_call_output', call_id: 'call_1', output: expect.stringContaining('Delegated review complete.') })
+    const hookOutput = (await readFile(join(dir, 'agent-stop.jsonl'), 'utf8')).trim()
+    expect(JSON.parse(hookOutput)).toMatchObject({ hook_event_name: 'SubagentStop', agent_type: agentType })
+  }, (_, turn) => responsesTurn(turn, turn === 1
+    ? { name: 'Agent', args: { description: 'Review fixture', prompt: 'Review the fixture.', subagent_type: agentType } }
+    : turn === 2 ? 'Delegated review complete.' : fixtureReply))
+}, 15_000)
+
+test('Responses API loads ancestor and CWD AGENTS.md in order and adds nested guidance only after Read', async () => {
+  const ancestor = 'fixture-guidance-ancestor'
+  const local = 'fixture-guidance-cwd'
+  const nested = 'fixture-guidance-nested'
+  const excluded = 'fixture-guidance-excluded'
+  let target: string
+  await withResponsesCLI(async ({ dir, requests, run }) => {
+    const cwd = join(dir, 'project')
+    const feature = join(cwd, 'feature')
+    const deep = join(feature, 'deep')
+    const excludedPath = join(deep, 'AGENTS.md')
+    target = join(deep, 'fixture.txt')
+    await mkdir(deep, { recursive: true })
+    await Promise.all([
+      writeFile(join(dir, 'AGENTS.md'), `${ancestor}\n`),
+      writeFile(join(cwd, 'AGENTS.md'), `${local}\n`),
+      writeFile(join(feature, 'AGENTS.md'), `${nested}\n`),
+      writeFile(excludedPath, `${excluded}\n`),
+      writeFile(target, 'Nested fixture contents.\n'),
+    ])
+    const readArgs = ['--tools', 'Read', '--allowedTools', 'Read']
+    expect(await run(readArgs, cwd)).toMatchObject({ code: 0, stdout: expect.stringContaining(fixtureReply) })
+    expect(await run([...readArgs, '--settings', JSON.stringify({ claudeMdExcludes: [excludedPath.replaceAll('\\', '/')] })], cwd))
+      .toMatchObject({ code: 0, stdout: expect.stringContaining(fixtureReply) })
+    expect(requests).toHaveLength(4)
+    const markers = (body: RequestBody) => JSON.stringify(body.input).match(/fixture-guidance-(?:ancestor|cwd|nested|excluded)/g)
+    expect(markers(requests[0]!)).toEqual([ancestor, local])
+    expect(markers(requests[1]!)).toEqual([ancestor, local, nested, excluded])
+    expect(markers(requests[2]!)).toEqual([ancestor, local])
+    expect(markers(requests[3]!)).toEqual([ancestor, local, nested])
+    expect(requests[3]!.input).toContainEqual({ type: 'function_call_output', call_id: 'call_3', output: expect.stringContaining('Nested fixture contents.') })
+  }, (_, turn) => responsesTurn(turn, turn % 2 === 1 ? { name: 'Read', args: { file_path: target } } : fixtureReply))
+}, 25_000)
+
+test('Responses API sends image Read data inside structured function_call_output', async () => {
+  // A 1x1 PNG fixture, small enough to pass through Read without resizing.
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
+  let image: string
+  await withResponsesCLI(async ({ dir, requests, run }) => {
+    image = join(dir, 'pixel.png')
+    await writeFile(image, Buffer.from(png, 'base64'))
+    expect(await run(['--tools', 'Read', '--allowedTools', 'Read']))
+      .toMatchObject({ code: 0, stdout: expect.stringContaining(fixtureReply) })
+    expect(requests).toHaveLength(2)
+    const output = requests[1]!.input.filter(item => item.type === 'function_call_output')
+    expect(output).toEqual([{
+      type: 'function_call_output', call_id: 'call_1',
+      output: [{ type: 'input_image', image_url: `data:image/png;base64,${png}`, detail: 'auto' }],
+    }])
+    expect(requests[1]!.input.flatMap(item => item.content ?? []).some(block => block.type === 'input_image')).toBe(false)
+  }, (_, turn) => responsesTurn(turn, turn === 1 ? { name: 'Read', args: { file_path: image } } : fixtureReply))
+}, 15_000)
+
+test('a USD limit with unpriced Responses credentials fails before an API request', async () => {
+  await withResponsesCLI(async ({ requests, run }) => {
+    const result = await run(['--tools', '', '--max-budget-usd', '0.01'])
+    expect(result.code).toBe(1)
+    expect(result.stdout + result.stderr).toContain('Cannot enforce --max-budget-usd')
+    expect(requests).toHaveLength(0)
+  })
+}, 15_000)
+
+for (const { status, errorCode, primaryAttempts, switches } of [
+  { status: 503, errorCode: 'service_unavailable', primaryAttempts: 4, switches: true },
+  { status: 429, errorCode: 'rate_limit_exceeded', primaryAttempts: 4, switches: false },
+  { status: 401, errorCode: 'invalid_api_key', primaryAttempts: 1, switches: false },
+]) {
+  test(`Responses API ${switches ? 'switches to' : 'does not switch to'} the fallback model after HTTP ${status}`, async () => {
+    const primary = 'gpt-6.2-sol'
+    const fallback = 'gpt-6.2-astra'
+    const message = `Fixture API failure (${status}).`
+    await withResponsesCLI(async ({ requests, run }) => {
+      const result = await run(['--tools', '', '--model', primary, '--fallback-model', fallback])
+      expect(requests.map(body => body.model)).toEqual(
+        [...Array.from({ length: primaryAttempts }, () => primary), ...(switches ? [fallback] : [])],
+      )
+      if (switches) {
+        expect(result.code).toBe(0)
+        expect(result.stdout).toContain(fixtureReply)
+        expect(result.stdout).not.toContain(message)
+      } else {
+        expect(result.code).toBe(1)
+        expect(result.stdout + result.stderr).toContain(message)
+      }
+    }, (body, turn) => body.model === fallback
+      ? responsesTurn(turn, fixtureReply)
+      : Response.json({ error: { code: errorCode, message } }, { status, headers: { 'Retry-After': '0.01' } }))
+  }, 15_000)
+}

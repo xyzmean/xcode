@@ -31,6 +31,11 @@ jobs:
             exit 1
           fi
       - run: bun install --frozen-lockfile
+      - name: Install ripgrep for integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
       - run: bun run build:all
       - run: bun test script/openai.integration.test.ts script/ota.test.ts
       - name: Stage release assets

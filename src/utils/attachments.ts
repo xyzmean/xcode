@@ -1659,7 +1659,7 @@ async function getSelectedLinesFromIDE(
 /**
  * Computes the directories to process for nested memory file loading.
  * Returns two lists:
- * - nestedDirs: Directories between CWD and targetPath (processed for CLAUDE.md + all rules)
+ * - nestedDirs: Directories between CWD and targetPath (processed for project instructions and all rules)
  * - cwdLevelDirs: Directories from root to CWD (processed for conditional rules only)
  *
  * @param targetPath The target file path
@@ -1675,16 +1675,16 @@ export function getDirectoriesToProcess(
   const nestedDirs: string[] = []
   let currentDir = targetDir
 
-  // Walk up from target directory to original CWD
+  // A sibling with the same path prefix is not nested under CWD.
   while (currentDir !== originalCwd && currentDir !== parse(currentDir).root) {
-    if (currentDir.startsWith(originalCwd)) {
-      nestedDirs.push(currentDir)
-    }
+    nestedDirs.push(currentDir)
     currentDir = dirname(currentDir)
   }
-
-  // Reverse to get order from CWD down to target
-  nestedDirs.reverse()
+  if (currentDir === originalCwd) {
+    nestedDirs.reverse()
+  } else {
+    nestedDirs.length = 0
+  }
 
   // Build list of directories from root to CWD (for conditional rules only)
   const cwdLevelDirs: string[] = []

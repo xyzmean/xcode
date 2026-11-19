@@ -675,7 +675,7 @@ async function* queryLoop(
               toolChoice: undefined,
               isNonInteractiveSession:
                 toolUseContext.options.isNonInteractiveSession,
-              fallbackModel,
+              fallbackModel: currentModel === fallbackModel ? undefined : fallbackModel,
               onStreamingFallback: () => {
                 streamingFallbackOccured = true
               },
